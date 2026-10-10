@@ -49,6 +49,17 @@ uv run yadisk_download.py get disk:/ -o ./out \
 Paths may be written `disk:/Photos` or `/Photos`. `disk:/Photos` lands in `out/Photos/...`;
 `--flat` drops the structure.
 
+A transfer that goes quiet is reconnected from the last byte on disk. `--timeout` sets how
+long to wait for bytes before doing so (default 90 seconds); lower it on a flaky link so
+dead connections are abandoned sooner:
+
+```bash
+uv run yadisk_download.py get disk:/Загрузки -o ./out --timeout 30
+```
+
+Progress is reported only once a transfer has run for 10 seconds, so small files download
+silently. On a terminal the line redraws in place; piped or in CI it prints every 15 seconds.
+
 ## Behaviour
 
 - **Incremental:** a file already present with the right size and checksum is skipped.

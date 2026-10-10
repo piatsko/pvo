@@ -464,8 +464,16 @@ def cmd_auth(args: argparse.Namespace) -> int:
     return 0
 
 
+def _client(args: argparse.Namespace) -> YandexDisk:
+    if args.timeout <= 0:
+        raise YandexDiskError("--timeout must be positive")
+    return YandexDisk(
+        read_token(args.token_file), timeout=(min(15.0, args.timeout), args.timeout)
+    )
+
+
 def cmd_whoami(args: argparse.Namespace) -> int:
-    info = YandexDisk(read_token(args.token_file)).disk_info()
+    info = _client(args).disk_info()
     user = info.get("user", {})
     total, used = int(info.get("total_space", 0)), int(info.get("used_space", 0))
     print(f"user:  {user.get('display_name') or user.get('login', '?')}")
@@ -475,7 +483,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
-    disk = YandexDisk(read_token(args.token_file))
+    disk = _client(args)
     path = normalize_remote(args.path)
     files = dirs = 0
     total = 0
@@ -493,7 +501,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
 
 
 def cmd_get(args: argparse.Namespace) -> int:
-    disk = YandexDisk(read_token(args.token_file))
+    disk = _client(args)
     dest: Path = args.output.expanduser()
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -570,9 +578,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=default_token_file(),
         help="where the OAuth token lives (default: %(default)s)",
     )
-    # Accept --token-file after the subcommand too; SUPPRESS keeps the global default.
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=90.0,
+        metavar="SECONDS",
+        help="how long a transfer may deliver nothing before it is reconnected "
+        "(default: %(default)s)",
+    )
+
+    # Accept the shared options after the subcommand too; SUPPRESS keeps the global default.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--token-file", type=Path, default=argparse.SUPPRESS)
+    common.add_argument(
+        "--timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="SECONDS",
+        help="seconds of silence before a transfer is reconnected (default: 90)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
