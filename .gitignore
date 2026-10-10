@@ -1,0 +1,14 @@
+# never commit credentials
+token.txt
+*.token
+.env
+
+# local downloads
+/yadisk/
+/out/
+/downloads/
+
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
