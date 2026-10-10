@@ -113,11 +113,11 @@ class RemoteFile:
     modified: str | None = None
 
 
-def _session(auth_token: str | None = None) -> requests.Session:
+def _session(auth_token: str | None = None, retries: int = 6) -> requests.Session:
     retry = Retry(
-        total=6,
-        connect=6,
-        read=6,
+        total=retries,
+        connect=retries,
+        read=retries,
         backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET"}),
@@ -135,10 +135,12 @@ class YandexDisk:
         self,
         token: str,
         timeout: tuple[float, float] = (15.0, 90.0),
-        max_reconnects: int = 8,
+        max_reconnects: int = 5,
     ) -> None:
         self.api = _session(token)
-        self.content = _session()  # download hrefs are pre-signed; send no token there
+        # Download hrefs are pre-signed, so no token here. Few low-level retries:
+        # the reconnect loop in download() handles failures, with better accounting.
+        self.content = _session(retries=2)
         self.timeout = timeout
         self.max_reconnects = max_reconnects
 
@@ -216,10 +218,13 @@ class YandexDisk:
 
         progress = Progress(remote.size, existing)
         stalls = 0
+        furthest = existing
         while True:
             position = target.stat().st_size if target.exists() else 0
             if position >= remote.size:
                 break
+            if position > furthest:  # it is still moving, so forgive earlier drops
+                furthest, stalls = position, 0
             try:
                 self._fetch_from(remote, target, position, progress)
             except (requests.RequestException, OSError) as exc:
@@ -227,7 +232,8 @@ class YandexDisk:
                 if stalls > self.max_reconnects:
                     progress.finish()
                     raise YandexDiskError(
-                        f"Transfer failed for {remote.path} after {stalls} attempts: {exc}"
+                        f"Transfer stalled at {human(position)} of {human(remote.size)} for "
+                        f"{remote.path} after {stalls} attempts without progress: {exc}"
                     ) from exc
                 pause = min(2**stalls, 30)
                 progress.note(f"{type(exc).__name__}, reconnecting in {pause}s")
@@ -239,7 +245,7 @@ class YandexDisk:
             raise IntegrityError(
                 f"Size mismatch for {remote.path}: expected {remote.size}, got {actual}"
             )
-        if remote.size > 256 * 1024 * 1024:
+        if remote.size > 256 * 1024 * 1024:  # hashing this much is slow and silent
             print(f"    verifying {human(remote.size)}...", file=sys.stderr, flush=True)
         if not _verify(target, remote):
             target.unlink(missing_ok=True)
@@ -351,13 +357,17 @@ class Progress:
     for half an hour; without periodic output that is indistinguishable from a hang.
     """
 
-    def __init__(self, total: int, done: int = 0, interval: float = 15.0) -> None:
+    def __init__(
+        self, total: int, done: int = 0, interval: float = 15.0, delay: float = 10.0
+    ) -> None:
         self.total = total
         self.done = self.base = done
         self.interval = interval
+        self.delay = delay  # stay quiet about transfers that finish quickly
         self.tty = sys.stderr.isatty()
         self.started = time.monotonic()
         self.last_line = 0.0
+        self.drawn = False
 
     def restart(self, position: int) -> None:
         """A new connection took over from position; reset the rate window."""
@@ -367,20 +377,24 @@ class Progress:
     def update(self, position: int) -> None:
         self.done = position
         now = time.monotonic()
+        if now - self.started < self.delay:
+            return
         if self.tty:
             self._draw("\r")
+            self.drawn = True
         elif now - self.last_line >= self.interval:
             self._draw("\n")
         else:
             return
         self.last_line = now
+        self.drawn = True
 
     def note(self, message: str) -> None:
         self.finish()
         print(f"    {message}", file=sys.stderr, flush=True)
 
     def finish(self) -> None:
-        if self.tty:
+        if self.tty and self.drawn:
             sys.stderr.write("\r\033[K")
             sys.stderr.flush()
 
