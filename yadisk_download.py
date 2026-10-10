@@ -20,6 +20,7 @@ import hashlib
 import os
 import sys
 import tempfile
+import time
 import webbrowser
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -130,10 +131,16 @@ def _session(auth_token: str | None = None) -> requests.Session:
 
 
 class YandexDisk:
-    def __init__(self, token: str, timeout: tuple[float, float] = (15.0, 300.0)) -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: tuple[float, float] = (15.0, 90.0),
+        max_reconnects: int = 8,
+    ) -> None:
         self.api = _session(token)
         self.content = _session()  # download hrefs are pre-signed; send no token there
         self.timeout = timeout
+        self.max_reconnects = max_reconnects
 
     def _get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         response = self.api.get(f"{API_ROOT}/{endpoint}", params=params, timeout=self.timeout)
@@ -194,7 +201,9 @@ class YandexDisk:
     def download(self, remote: RemoteFile, target: Path) -> tuple[str, int]:
         """Download remote to target, resuming a partial file.
 
-        Returns the action taken and the number of bytes pulled over the network.
+        A dropped or stalled connection is reconnected from the last byte on
+        disk rather than failing the file. Returns the action taken and the
+        number of bytes pulled over the network.
         """
         target.parent.mkdir(parents=True, exist_ok=True)
         existing = target.stat().st_size if target.exists() else 0
@@ -205,39 +214,65 @@ class YandexDisk:
             target.unlink()
             existing = 0
 
-        headers = {"Range": f"bytes={existing}-"} if existing else {}
-        response = self.content.get(
-            self.download_url(remote.path), headers=headers, stream=True, timeout=self.timeout
-        )
-        with response:
-            if not (response.status_code == 416 and existing == remote.size):
-                if not response.ok:
-                    # Never echo the signed href into an error message.
+        progress = Progress(remote.size, existing)
+        stalls = 0
+        while True:
+            position = target.stat().st_size if target.exists() else 0
+            if position >= remote.size:
+                break
+            try:
+                self._fetch_from(remote, target, position, progress)
+            except (requests.RequestException, OSError) as exc:
+                stalls += 1
+                if stalls > self.max_reconnects:
+                    progress.finish()
                     raise YandexDiskError(
-                        f"Download failed for {remote.path} ({response.status_code})"
-                    )
-                resuming = existing > 0 and response.status_code == 206
-                if not resuming:
-                    existing = 0
-                done = existing
-                with target.open("ab" if resuming else "wb") as out:
-                    for chunk in response.iter_content(chunk_size=CHUNK):
-                        if not chunk:
-                            continue
-                        out.write(chunk)
-                        done += len(chunk)
-                        _progress(done, remote.size)
-                _progress_done()
+                        f"Transfer failed for {remote.path} after {stalls} attempts: {exc}"
+                    ) from exc
+                pause = min(2**stalls, 30)
+                progress.note(f"{type(exc).__name__}, reconnecting in {pause}s")
+                time.sleep(pause)
+        progress.finish()
 
         actual = target.stat().st_size
         if actual != remote.size:
             raise IntegrityError(
                 f"Size mismatch for {remote.path}: expected {remote.size}, got {actual}"
             )
+        if remote.size > 256 * 1024 * 1024:
+            print(f"    verifying {human(remote.size)}...", file=sys.stderr, flush=True)
         if not _verify(target, remote):
             target.unlink(missing_ok=True)
             raise IntegrityError(f"Checksum mismatch for {remote.path}")
         return ("resumed" if existing else "downloaded"), remote.size - existing
+
+    def _fetch_from(
+        self, remote: RemoteFile, target: Path, position: int, progress: Progress
+    ) -> None:
+        """Stream one attempt, appending from position. The href is re-signed each try."""
+        headers = {"Range": f"bytes={position}-"} if position else {}
+        response = self.content.get(
+            self.download_url(remote.path), headers=headers, stream=True, timeout=self.timeout
+        )
+        with response:
+            if response.status_code == 416 and position == remote.size:
+                return
+            if not response.ok:
+                # Never echo the signed href into an error message.
+                raise YandexDiskError(
+                    f"Download failed for {remote.path} ({response.status_code})"
+                )
+            appending = position > 0 and response.status_code == 206
+            if not appending:
+                position = 0  # the server ignored Range, so start the file over
+            progress.restart(position)
+            with target.open("ab" if appending else "wb") as out:
+                for chunk in response.iter_content(chunk_size=CHUNK):
+                    if not chunk:
+                        continue
+                    out.write(chunk)
+                    position += len(chunk)
+                    progress.update(position)
 
 
 def _verify(target: Path, remote: RemoteFile) -> bool:
@@ -300,17 +335,65 @@ def human(size: float) -> str:
     return f"{size:.1f} TiB"
 
 
-def _progress(done: int, total: int) -> None:
-    if not sys.stderr.isatty():
-        return
-    pct = done * 100 / total if total else 100.0
-    sys.stderr.write(f"\r    {human(done)} / {human(total)} ({pct:5.1f}%)")
-    sys.stderr.flush()
+def duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds}s"
 
 
-def _progress_done() -> None:
-    if sys.stderr.isatty():
-        sys.stderr.write("\r\033[K")
+class Progress:
+    """Redraw in place on a terminal, print a line every `interval` seconds otherwise.
+
+    Yandex throttles large downloads to a few MiB/s, so a multi-GiB file can run
+    for half an hour; without periodic output that is indistinguishable from a hang.
+    """
+
+    def __init__(self, total: int, done: int = 0, interval: float = 15.0) -> None:
+        self.total = total
+        self.done = self.base = done
+        self.interval = interval
+        self.tty = sys.stderr.isatty()
+        self.started = time.monotonic()
+        self.last_line = 0.0
+
+    def restart(self, position: int) -> None:
+        """A new connection took over from position; reset the rate window."""
+        self.done = self.base = position
+        self.started = time.monotonic()
+
+    def update(self, position: int) -> None:
+        self.done = position
+        now = time.monotonic()
+        if self.tty:
+            self._draw("\r")
+        elif now - self.last_line >= self.interval:
+            self._draw("\n")
+        else:
+            return
+        self.last_line = now
+
+    def note(self, message: str) -> None:
+        self.finish()
+        print(f"    {message}", file=sys.stderr, flush=True)
+
+    def finish(self) -> None:
+        if self.tty:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+    def _draw(self, end: str) -> None:
+        elapsed = max(time.monotonic() - self.started, 1e-6)
+        rate = (self.done - self.base) / elapsed
+        pct = self.done * 100 / self.total if self.total else 100.0
+        eta = duration((self.total - self.done) / rate) if rate > 0 else "?"
+        line = (
+            f"    {human(self.done)} / {human(self.total)} ({pct:5.1f}%)"
+            f"  {human(rate)}/s  ETA {eta}"
+        )
+        sys.stderr.write(line + ("\033[K" if self.tty else "") + end)
         sys.stderr.flush()
 
 
@@ -432,10 +515,10 @@ def cmd_get(args: argparse.Namespace) -> int:
             target = local_target(root, remote.path, dest, flat=args.flat)
 
             if args.dry_run:
-                print(f"would fetch  {human(remote.size):>10}  {remote.path} -> {target}")
+                print(f"would fetch  {human(remote.size):>10}  {remote.path} -> {target}", flush=True)
                 continue
 
-            print(f"{remote.path}  ({human(remote.size)})")
+            print(f"{remote.path}  ({human(remote.size)})", flush=True)
             try:
                 action, transferred = disk.download(remote, target)
             except (YandexDiskError, IntegrityError, OSError, requests.RequestException) as exc:
@@ -446,7 +529,7 @@ def cmd_get(args: argparse.Namespace) -> int:
                 continue
             counts[action] += 1
             bytes_fetched += transferred
-            print(f"  {action} -> {target}")
+            print(f"  {action} -> {target}", flush=True)
 
     if args.dry_run:
         print(f"\n{selected} files would be fetched")
