@@ -35,8 +35,11 @@ from urllib3.util.retry import Retry
 API_ROOT = "https://cloud-api.yandex.net/v1/disk"
 OAUTH_AUTHORIZE = "https://oauth.yandex.ru/authorize"
 APP_NAME = "yadisk-backup"
-CHUNK = 8 * 1024 * 1024
+CHUNK = 8 * 1024 * 1024  # buffer for hashing a local file
+STREAM_CHUNK = 1024 * 1024  # smaller, so --timeout is checked often on a slow link
 LIST_PAGE = 200
+CONNECT_TIMEOUT = 15.0
+READ_TIMEOUT = 90.0  # seconds of silence before a connection is considered stalled
 
 _ITEM_FIELDS = ("type", "name", "path", "size", "md5", "sha256", "modified", "mime_type")
 LIST_FIELDS = ",".join(
@@ -50,6 +53,18 @@ class YandexDiskError(RuntimeError):
 
 class IntegrityError(RuntimeError):
     pass
+
+
+class FileTimeout(RuntimeError):
+    """One file used up its --timeout budget. The partial download is kept."""
+
+    def __init__(self, path: str, position: int, size: int) -> None:
+        super().__init__(f"timed out at {human(position)} of {human(size)}")
+        self.path = path
+        self.position = position
+        self.size = size
+        self.elapsed = 0.0  # filled in by the caller, which knows when the file started
+        self.started_at = 0  # bytes already on disk when this run began
 
 
 # --------------------------------------------------------------------------- token
@@ -134,8 +149,9 @@ class YandexDisk:
     def __init__(
         self,
         token: str,
-        timeout: tuple[float, float] = (15.0, 90.0),
+        timeout: tuple[float, float] = (CONNECT_TIMEOUT, READ_TIMEOUT),
         max_reconnects: int = 5,
+        file_budget: float | None = None,
     ) -> None:
         self.api = _session(token)
         # Download hrefs are pre-signed, so no token here. Few low-level retries:
@@ -143,6 +159,7 @@ class YandexDisk:
         self.content = _session(retries=2)
         self.timeout = timeout
         self.max_reconnects = max_reconnects
+        self.file_budget = file_budget  # wall-clock seconds allowed per file, None = no cap
 
     def _get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         response = self.api.get(f"{API_ROOT}/{endpoint}", params=params, timeout=self.timeout)
@@ -217,6 +234,8 @@ class YandexDisk:
             existing = 0
 
         progress = Progress(remote.size, existing)
+        started = time.monotonic()
+        deadline = started + self.file_budget if self.file_budget else None
         stalls = 0
         furthest = existing
         while True:
@@ -226,7 +245,12 @@ class YandexDisk:
             if position > furthest:  # it is still moving, so forgive earlier drops
                 furthest, stalls = position, 0
             try:
-                self._fetch_from(remote, target, position, progress)
+                self._fetch_from(remote, target, position, progress, deadline)
+            except FileTimeout as timeout:
+                progress.finish()
+                timeout.elapsed = time.monotonic() - started
+                timeout.started_at = existing
+                raise
             except (requests.RequestException, OSError) as exc:
                 stalls += 1
                 if stalls > self.max_reconnects:
@@ -236,7 +260,9 @@ class YandexDisk:
                         f"{remote.path} after {stalls} attempts without progress: {exc}"
                     ) from exc
                 pause = min(2**stalls, 30)
-                progress.note(f"{type(exc).__name__}, reconnecting in {pause}s")
+                if deadline is not None:
+                    pause = min(pause, max(deadline - time.monotonic(), 0))
+                progress.note(f"{type(exc).__name__}, reconnecting in {pause:.0f}s")
                 time.sleep(pause)
         progress.finish()
 
@@ -253,12 +279,23 @@ class YandexDisk:
         return ("resumed" if existing else "downloaded"), remote.size - existing
 
     def _fetch_from(
-        self, remote: RemoteFile, target: Path, position: int, progress: Progress
+        self,
+        remote: RemoteFile,
+        target: Path,
+        position: int,
+        progress: Progress,
+        deadline: float | None = None,
     ) -> None:
         """Stream one attempt, appending from position. The href is re-signed each try."""
         headers = {"Range": f"bytes={position}-"} if position else {}
+        connect, read = self.timeout
+        if deadline is not None:  # a stalled read must not outlive the file's budget
+            read = max(min(read, deadline - time.monotonic()), 1.0)
         response = self.content.get(
-            self.download_url(remote.path), headers=headers, stream=True, timeout=self.timeout
+            self.download_url(remote.path),
+            headers=headers,
+            stream=True,
+            timeout=(min(connect, read), read),
         )
         with response:
             if response.status_code == 416 and position == remote.size:
@@ -273,12 +310,14 @@ class YandexDisk:
                 position = 0  # the server ignored Range, so start the file over
             progress.restart(position)
             with target.open("ab" if appending else "wb") as out:
-                for chunk in response.iter_content(chunk_size=CHUNK):
+                for chunk in response.iter_content(chunk_size=STREAM_CHUNK):
                     if not chunk:
                         continue
                     out.write(chunk)
                     position += len(chunk)
                     progress.update(position)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise FileTimeout(remote.path, position, remote.size)
 
 
 def _verify(target: Path, remote: RemoteFile) -> bool:
@@ -465,10 +504,15 @@ def cmd_auth(args: argparse.Namespace) -> int:
 
 
 def _client(args: argparse.Namespace) -> YandexDisk:
-    if args.timeout <= 0:
+    budget: float | None = args.timeout
+    if budget is not None and budget <= 0:
         raise YandexDiskError("--timeout must be positive")
+    # A per-file budget shorter than the stall timeout would never be reached otherwise.
+    read = min(READ_TIMEOUT, budget) if budget else READ_TIMEOUT
     return YandexDisk(
-        read_token(args.token_file), timeout=(min(15.0, args.timeout), args.timeout)
+        read_token(args.token_file),
+        timeout=(min(CONNECT_TIMEOUT, read), read),
+        file_budget=budget,
     )
 
 
@@ -505,7 +549,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     dest: Path = args.output.expanduser()
     dest.mkdir(parents=True, exist_ok=True)
 
-    counts = {"downloaded": 0, "resumed": 0, "skipped": 0, "failed": 0}
+    counts = {"downloaded": 0, "resumed": 0, "skipped": 0, "timed out": 0, "failed": 0}
+    timed_out: list[FileTimeout] = []
     bytes_fetched = 0
     selected = 0
 
@@ -543,6 +588,17 @@ def cmd_get(args: argparse.Namespace) -> int:
             print(f"{remote.path}  ({human(remote.size)})", flush=True)
             try:
                 action, transferred = disk.download(remote, target)
+            except FileTimeout as timeout:
+                counts["timed out"] += 1
+                timed_out.append(timeout)
+                bytes_fetched += timeout.position - timeout.started_at
+                print(
+                    f"  timed out after {duration(timeout.elapsed)} at "
+                    f"{human(timeout.position)} of {human(timeout.size)}"
+                    " - partial file kept, rerun to resume",
+                    flush=True,
+                )
+                continue
             except (YandexDiskError, IntegrityError, OSError, requests.RequestException) as exc:
                 counts["failed"] += 1
                 print(f"  FAILED: {exc}", file=sys.stderr)
@@ -556,11 +612,20 @@ def cmd_get(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"\n{selected} files would be fetched")
         return 0
-    print(
-        f"\n{counts['downloaded']} downloaded, {counts['resumed']} resumed, "
-        f"{counts['skipped']} already present, {counts['failed']} failed "
-        f"({human(bytes_fetched)} transferred)"
+    summary = (
+        f"{counts['downloaded']} downloaded, {counts['resumed']} resumed, "
+        f"{counts['skipped']} already present"
     )
+    if counts["timed out"]:
+        summary += f", {counts['timed out']} timed out"
+    summary += f", {counts['failed']} failed ({human(bytes_fetched)} transferred)"
+    print(f"\n{summary}")
+
+    if timed_out:
+        print("\nhit the --timeout budget, rerun to resume where each left off:")
+        for timeout in timed_out:
+            got = timeout.position * 100 / timeout.size if timeout.size else 100.0
+            print(f"  {timeout.path}  ({got:.1f}% of {human(timeout.size)})")
     return 1 if counts["failed"] else 0
 
 
@@ -581,10 +646,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=90.0,
+        default=None,
         metavar="SECONDS",
-        help="how long a transfer may deliver nothing before it is reconnected "
-        "(default: %(default)s)",
+        help="give up on a single file after this many seconds and move on to the "
+        "next; the partial download is kept and resumes on a rerun (default: no limit)",
     )
 
     # Accept the shared options after the subcommand too; SUPPRESS keeps the global default.
@@ -595,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=argparse.SUPPRESS,
         metavar="SECONDS",
-        help="seconds of silence before a transfer is reconnected (default: 90)",
+        help="seconds to spend on one file before skipping it (default: no limit)",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
